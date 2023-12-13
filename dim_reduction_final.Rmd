@@ -1,0 +1,263 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+```{r}
+
+library(tidyverse)
+library(tidyr)
+library(dplyr)
+library(FactoMineR)
+library(factoextra)
+library(flexclust)
+
+```
+
+Read original data
+
+```{r}
+
+df<-readRDS("LivRnaData.rds")
+View(df)
+str(df)
+
+# original data : 3,164,307 entries, 6 total columns
+
+```
+
+Pre - processing the data
+
+```{r}
+
+################################################################################
+#                         Transform to wide format                             #
+################################################################################
+
+# Transform the original data into wide format
+
+df_wide <- df %>%
+  pivot_wider(
+    id_cols = c(strain, sex, animal, condition),
+    names_from = trait,
+    values_from = value,
+    values_fn = list(mean = mean)
+  )
+
+df_wide=data.frame(lapply(df_wide, function(x) gsub("NULL", NA, x)))
+# View(df_wide)
+str(df_wide)
+
+df_wide[, 5:ncol(df_wide)] <- sapply(df_wide[, 5:ncol(df_wide)], as.numeric)
+
+str(df_wide)
+# View(df_wide)
+# df_wide$Ndor1
+
+
+
+```
+
+
+```{r}
+
+################################################################################
+#                             Replace null values                              #
+################################################################################
+
+# Substituting the null values with column wise mean values
+# Stored the transformed data into a new CSV file (as wide_df.csv) so that I didn't need to preprocess every time I restarted
+
+df2=read.csv("wide_df.csv") 
+
+# Count null values
+null_count <- colSums(is.na(df2))
+summary(null_count)
+
+# Identify numeric columns 
+numeric_cols <- df2[, sapply(df2, is.numeric)]
+str(numeric_cols)
+
+# Calculate column means for numeric columns
+column_means <- colMeans(numeric_cols, na.rm = TRUE)
+# View(column_means)
+
+# Fill NA with means that were previously calculated 
+for (col_index in seq_along(column_means)) {
+  col_name <- names(column_means)[col_index]
+  df2[, col_name][is.na(df2[, col_name])] <- column_means[col_index]
+}
+
+sum(is.na(df2))
+
+################################################################################
+# Some exploratory analysis
+################################################################################
+
+na_counts <- colSums(is.na(df2))
+
+# Identify columns with more than one NA value
+columns_with_more_than_one_na <- names(na_counts[na_counts > 1])
+
+# Print the names of columns with more than one NA value
+print(columns_with_more_than_one_na)
+
+df2 <- df2[, !names(df2) %in% c("Ndor1", "Ptp4a1","X")]
+
+```
+
+Dimension Reduction techniques
+
+1. PCA
+
+```{r}
+
+################################################################################
+#                              Method 1 - PCA                                  #
+################################################################################
+ 
+# Calculate PCA on df2 
+df3 <- df2[, !(names(df2) %in% c("strain", "sex", "condition","animal"))]
+pca_result <- prcomp(df3, scale = TRUE)
+# View(pca_result$rotation)
+
+# Access the principal component loadings
+loadings_matrix <- pca_result$rotation
+# View(loadings_matrix)
+
+cumulative_variance <- cumsum(pca_result$sdev^2) / sum(pca_result$sdev^2)
+plot(cumulative_variance, xlab = "Number of Components", ylab = "Cumulative Explained Variance", type = "b")
+
+# Find the index of the elbow point 
+elbow_index <- which(diff(cumulative_variance) < 0.01)[1]
+
+# Determine the number of components to retain
+num_components_to_retain <- elbow_index
+
+cat("Number of components to retain:", num_components_to_retain, "\n")
+
+# Extract the loadings of first 15 principal components
+loadings_matrix <- pca_result$rotation[, 1:15]
+
+# Identify original column names that contribute the most to each component
+selected_columns <- apply(abs(loadings_matrix), 2, which.max)
+
+# Get names of selected columns
+selected_column_names <- colnames(df2)[selected_columns]
+
+cat("Selected column names:", selected_column_names, "\n")
+
+# Choose the 15 columns from df2 based on the selected indices
+selected_data <- df2[, selected_columns]
+
+# Include columns "strain", "sex", "condition", and "animal"
+selected_data <- cbind(df2[c("strain", "sex", "condition", "animal")], selected_data)
+
+head(selected_data)
+
+fix_vars <- c("strain", "sex", "condition", "animal")
+
+# Define the trait variables
+trait_vars <- setdiff(colnames(selected_data), fix_vars)
+
+long_data <- pivot_longer(selected_data, cols = trait_vars, names_to = "trait", values_to = "value")
+
+# View(long_data)
+
+# write.csv(long_data,"LivRnaData_PCA.csv")
+
+###############################################################################
+# FINAL RESULT:  2,880 entries, 6 total columns
+###############################################################################
+
+```
+
+2. Aggregation 
+
+```{r}
+
+###############################################################################
+#                   Method 2.1 - Aggregating by MEAN                            #
+###############################################################################
+
+
+# For each group we have 6 values (including NA), so instead lets have 1 rows by aggregating my mean
+
+data_aggregated_mean <- df2 %>%
+  group_by(strain, sex, condition) %>%
+  summarise(across(where(is.numeric), mean, na.rm = TRUE)) %>%
+  ungroup()
+
+
+#View(data_aggregated_mean)
+
+```
+
+
+```{r}
+
+# convert to long format
+long_data_mean <- data_aggregated_mean %>%
+  pivot_longer(cols = -c(strain, sex, condition,animal),
+               names_to = "Traits",
+               values_to = "Value")
+
+# View(long_data_mean)
+# write.csv(long_data_mean,"LivRnaData_mean_aggregation.csv")
+
+
+# FINAL RESULT : 604,512 entries, 6 total columns
+```
+
+
+```{r}
+
+###############################################################################
+#                   Method 2.2 - Aggregating by K MEANS                       #
+###############################################################################
+
+# For each group find 3 centroids using k means
+
+
+# Group the data
+grouped_data <- df2 %>%
+  group_by(sex, strain, condition)
+
+kmeans_within_group <- function(data, centers = 3) {
+  if (nrow(data) < centers || nrow(data) == 0) {
+    message("Skipping K-means for a group with fewer data points than centers or no data points.")
+    message("Group Info:", unique(data$sex), unique(data$strain), unique(data$condition))
+    return(rep(NA, ncol(data)))
+  }
+  kmeans(data, centers = centers)$centers
+}
+
+
+# Calculate centroids for each group using K-means
+
+centroids <- grouped_data %>%
+  group_modify(~ data.frame(centroid = kmeans_within_group(.x, centers = 3)))
+View(centroids)
+
+# head(centroids)
+
+
+```
+
+```{r}
+
+# Convert to long format
+centroid_long <- centroids %>%
+  pivot_longer(cols = -c(strain, sex, condition,centroid.animal),
+               names_to = "Traits",
+               values_to = "Value")
+
+# View(centroid_long)
+# write.csv(centroid_long,"LivRnaData_centroid_aggregation.csv")
+
+# Final result : 1,813,536 entries, 6 total columns
+
+```
+
+0
